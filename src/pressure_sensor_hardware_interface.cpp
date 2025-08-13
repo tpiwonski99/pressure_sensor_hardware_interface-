@@ -63,11 +63,9 @@ PressureSensor::export_state_interfaces()
 hardware_interface::return_type
 PressureSensor::read(const rclcpp::Time &, const rclcpp::Duration &)
 {
-  contact_state_ = latest_contact_.load() ? 1.0 : 0.0;
+  contact_state_ = latest_contact_.load(std::memory_order_relaxed) ? 1.0 : 0.0;
   return hardware_interface::return_type::OK;
 }
-
-/* ===== UDP ===== */
 
 bool PressureSensor::open_udp(uint16_t port)
 {
@@ -81,18 +79,21 @@ bool PressureSensor::open_udp(uint16_t port)
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(port);
+  addr.sin_port   = htons(port);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
   if (bind(sock_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
     perror("bind");
-    ::close(sock_fd_); sock_fd_ = -1; return false;
+    ::close(sock_fd_);
+    sock_fd_ = -1;
+    return false;
   }
 
   int flags = fcntl(sock_fd_, F_GETFL, 0);
   fcntl(sock_fd_, F_SETFL, flags | O_NONBLOCK);
 
-  std::cout << "[pressure_sensor_hw] UDP listening on port " << port << std::endl;
+  RCLCPP_INFO(rclcpp::get_logger("pressure_sensor_hw"),
+              "UDP listening on port %u", (unsigned)port);
   return true;
 }
 
@@ -104,23 +105,20 @@ void PressureSensor::close_udp()
 void PressureSensor::rx_thread_fn()
 {
   constexpr int BUF_SZ = 64;
-  char buf[BUF_SZ];
+  unsigned char buf[BUF_SZ];          
 
   while (rx_running_) {
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(sock_fd_, &rfds);
-    timeval tv{0, 100000}; 
+    fd_set rfds; FD_ZERO(&rfds); FD_SET(sock_fd_, &rfds);
+    timeval tv{0, 100000};           
 
     int ready = select(sock_fd_ + 1, &rfds, nullptr, nullptr, &tv);
     if (ready > 0 && FD_ISSET(sock_fd_, &rfds)) {
       sockaddr_in peer{}; socklen_t plen = sizeof(peer);
-      ssize_t n = recvfrom(sock_fd_, buf, BUF_SZ, 0,
-                           reinterpret_cast<sockaddr*>(&peer), &plen);
+      const ssize_t n = recvfrom(sock_fd_, buf, BUF_SZ, 0,
+                                 reinterpret_cast<sockaddr*>(&peer), &plen);
       if (n > 0) {
         for (ssize_t i = 0; i < n; ++i) {
-          if (buf[i] == '0') latest_contact_.store(false, std::memory_order_relaxed);
-          else if (buf[i] == '1') latest_contact_.store(true, std::memory_order_relaxed);
+          latest_contact_.store(buf[i] != 0, std::memory_order_relaxed);
         }
       }
     }
